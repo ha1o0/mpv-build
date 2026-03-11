@@ -1,0 +1,107 @@
+name: Build libmpv (Linux amd64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'libmpv version (e.g., v0.37.0)'
+        required: true
+        default: 'v0.37.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout mpv-build
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            yasm \
+            nasm \
+            pkg-config \
+            libtool \
+            autoconf \
+            automake \
+            libx11-dev \
+            libxv-dev \
+            libvdpau-dev \
+            libva-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libdrm-dev \
+            libasound2-dev \
+            libpulse-dev \
+            libfribidi-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libharfbuzz-dev \
+            libjpeg-dev \
+            libssl-dev \
+            libx264-dev \
+            python3-setuptools \
+            python3-pip
+
+      - name: Install latest Meson and Ninja
+        run: |
+          # 移除系统自带的旧版（如果有）并安装最新版
+          sudo apt-get remove -y meson ninja-build || true
+          python3 -m pip install --upgrade pip
+          sudo pip3 install meson ninja
+          # 确保路径生效
+          echo "/usr/local/bin" >> $GITHUB_PATH
+          meson --version
+          ninja --version
+
+      - name: Configure FFmpeg options
+        run: |
+          # 基本必须选项
+          echo "--enable-gpl" >> ffmpeg_options
+          echo "--enable-nonfree" >> ffmpeg_options
+          echo "--enable-libx264" >> ffmpeg_options
+          
+          # 添加用户要求的 RM/RMVB 相关解码器
+          for decoder in rv10 rv20 rv30 rv40 cook atrac3 sipr ra_144 ra_288; do
+            echo "--enable-decoder=$decoder" >> ffmpeg_options
+          done
+          
+          echo "FFmpeg options configured:"
+          cat ffmpeg_options
+
+      - name: Configure mpv options
+        run: |
+          echo "-Dlibmpv=true" > mpv_options
+          echo "mpv options configured:"
+          cat mpv_options
+
+      - name: Fetch sources and Build
+        run: |
+          ./update
+          ./rebuild -j$(nproc)
+
+      - name: Prepare Artifact
+        run: |
+          mkdir -p output
+          # 复制生成的 .so 文件，并重命名以便分发
+          cp mpv/build/libmpv.so output/libmpv-amd64.so
+          # 打印链接情况以供验证 (检查是否有意外的动态依赖)
+          ldd output/libmpv-amd64.so
+
+      - name: Create Release and Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Release ${{ github.event.inputs.version }}
+          files: output/libmpv-amd64.so
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

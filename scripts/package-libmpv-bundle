@@ -27,6 +27,7 @@ should_skip_library()
     case "$1" in
         linux-vdso*|ld-linux*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s.so*|libstdc++.so*) return 0 ;;
         libGL.so*|libEGL.so*|libGLES*.so*|libOpenGL.so*|libGLX.so*|libglapi.so*) return 0 ;;
+        libssl.so*|libcrypto.so*) return 0 ;;
         libdrm.so*|libgbm.so*|libwayland*.so*|libX*.so*|libxcb*.so*|libxkbcommon*.so*) return 0 ;;
         libasound.so*|libpulse*.so*|libjack.so*) return 0 ;;
         libgtk*.so*|libgdk*.so*|libglib*.so*|libgobject*.so*|libgio*.so*|libgmodule*.so*) return 0 ;;

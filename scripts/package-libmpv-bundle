@@ -1,0 +1,88 @@
+#!/bin/sh
+set -eu
+
+ARCH="${1:-x86_64}"
+BUNDLE_NAME="${2:-libmpv-linux-${ARCH}-gpu-next}"
+OUTPUT_DIR="${3:-output}"
+ROOT_DIR="$OUTPUT_DIR/$BUNDLE_NAME"
+LIB_DIR="$ROOT_DIR/lib"
+
+if [ ! -f mpv/build/libmpv.so ]; then
+    echo "mpv/build/libmpv.so was not found. Build mpv before packaging." >&2
+    exit 1
+fi
+
+rm -rf "$ROOT_DIR"
+mkdir -p "$LIB_DIR"
+
+install -m 0644 mpv/build/libmpv.so "$LIB_DIR/libmpv.so.2"
+ln -sf libmpv.so.2 "$LIB_DIR/libmpv.so"
+
+if command -v patchelf >/dev/null 2>&1; then
+    patchelf --set-soname libmpv.so.2 --set-rpath '$ORIGIN' "$LIB_DIR/libmpv.so.2"
+fi
+
+should_skip_library()
+{
+    case "$1" in
+        linux-vdso*|ld-linux*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s.so*|libstdc++.so*) return 0 ;;
+        libGL.so*|libEGL.so*|libGLES*.so*|libOpenGL.so*|libGLX.so*|libglapi.so*) return 0 ;;
+        libdrm.so*|libgbm.so*|libwayland*.so*|libX*.so*|libxcb*.so*|libxkbcommon*.so*) return 0 ;;
+        libasound.so*|libpulse*.so*|libjack.so*) return 0 ;;
+        libgtk*.so*|libgdk*.so*|libglib*.so*|libgobject*.so*|libgio*.so*|libgmodule*.so*) return 0 ;;
+        libpango*.so*|libcairo*.so*|libatk*.so*|libepoxy.so*|libfontconfig.so*|libfreetype.so*) return 0 ;;
+        libdbus*.so*|libudev.so*|libsystemd.so*|libselinux.so*|libmount.so*|libblkid.so*) return 0 ;;
+        libresolv.so*|libnss*.so*|libz.so*|libexpat.so*) return 0 ;;
+    esac
+    return 1
+}
+
+copy_deps()
+{
+    ldd "$1" 2>/dev/null | awk '/=> \//{print $3} /^\/.* \(0x/{print $1}' | while read -r dep; do
+        [ -f "$dep" ] || continue
+        base="$(basename "$dep")"
+        if should_skip_library "$base"; then
+            continue
+        fi
+        if [ ! -e "$LIB_DIR/$base" ]; then
+            cp -L "$dep" "$LIB_DIR/$base"
+            chmod 0644 "$LIB_DIR/$base"
+            if command -v patchelf >/dev/null 2>&1; then
+                patchelf --set-rpath '$ORIGIN' "$LIB_DIR/$base" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+i=0
+while [ "$i" -lt 6 ]; do
+    before="$(find "$LIB_DIR" -maxdepth 1 -type f | wc -l)"
+    for lib in "$LIB_DIR"/*.so*; do
+        [ -f "$lib" ] || continue
+        copy_deps "$lib"
+    done
+    after="$(find "$LIB_DIR" -maxdepth 1 -type f | wc -l)"
+    [ "$before" = "$after" ] && break
+    i=$((i + 1))
+done
+
+{
+    echo "name=$BUNDLE_NAME"
+    echo "arch=$ARCH"
+    echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for project in ffmpeg libass libplacebo mpv; do
+        if [ -d "$project/.git" ]; then
+            echo "$project=$(git -C "$project" rev-parse HEAD)"
+        fi
+    done
+} > "$ROOT_DIR/manifest.txt"
+
+ldd "$LIB_DIR/libmpv.so.2" > "$ROOT_DIR/ldd-libmpv.txt"
+find "$LIB_DIR" -maxdepth 1 -type f -printf '%f\n' | sort > "$ROOT_DIR/lib-files.txt"
+
+mkdir -p "$OUTPUT_DIR"
+tar -I 'zstd -19 -T0' -cf "$OUTPUT_DIR/$BUNDLE_NAME.tar.zst" -C "$OUTPUT_DIR" "$BUNDLE_NAME"
+
+sha256sum "$OUTPUT_DIR/$BUNDLE_NAME.tar.zst" > "$OUTPUT_DIR/$BUNDLE_NAME.tar.zst.sha256"
+echo "Created $OUTPUT_DIR/$BUNDLE_NAME.tar.zst"

@@ -10,5 +10,11 @@ scripts/libass-config
 scripts/libass-build "$@"
 scripts/ffmpeg-config
 scripts/ffmpeg-build "$@"
+
+if test -d libplacebo/3rdparty/Vulkan-Headers/include ; then
+    mkdir -p build_libs/include
+    cp -a libplacebo/3rdparty/Vulkan-Headers/include/. build_libs/include/
+fi
+
 scripts/mpv-config
 scripts/mpv-build "$@"

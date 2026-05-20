@@ -5,23 +5,40 @@ do_clone()
 {
     set -ex
     if ! test -e "$1" ; then
-        git clone "$2" "$1"
+        git clone --depth 1 "$2" "$1"
     fi
     (
         cd "$1"
         git remote set-url origin "$2"
-        git fetch
-        git submodule update --init
+        git fetch --depth 1 origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+        case "$1" in
+            libplacebo)
+                git submodule update --init --depth 1 \
+                    3rdparty/Vulkan-Headers \
+                    3rdparty/fast_float \
+                    3rdparty/glad \
+                    3rdparty/jinja \
+                    3rdparty/markupsafe
+                ;;
+            *)
+                git submodule update --init --depth 1
+                ;;
+        esac
     )
 }
 
 do_clone_all()
 {
-    do_clone "ffmpeg"     "https://github.com/FFmpeg/FFmpeg.git"
+    FFMPEG_REPOSITORY="${FFMPEG_REPOSITORY:-https://github.com/FFmpeg/FFmpeg.git}"
+    LIBASS_REPOSITORY="${LIBASS_REPOSITORY:-https://github.com/libass/libass.git}"
+    LIBPLACEBO_REPOSITORY="${LIBPLACEBO_REPOSITORY:-https://github.com/haasn/libplacebo.git}"
+    MPV_REPOSITORY="${MPV_REPOSITORY:-https://github.com/mpv-player/mpv.git}"
+
+    do_clone "ffmpeg"     "$FFMPEG_REPOSITORY"
     #do_clone "fribidi"    "http://anongit.freedesktop.org/git/fribidi/fribidi.git"
-    do_clone "libass"     "https://github.com/libass/libass.git"
-    do_clone "libplacebo" "https://github.com/haasn/libplacebo.git"
-    do_clone "mpv"        "https://github.com/mpv-player/mpv.git"
+    do_clone "libass"     "$LIBASS_REPOSITORY"
+    do_clone "libplacebo" "$LIBPLACEBO_REPOSITORY"
+    do_clone "mpv"        "$MPV_REPOSITORY"
 }
 
 do_gitmaster()
@@ -63,7 +80,7 @@ do_fixedref()
 {
     (
         cd "$1"
-        git checkout "$2"
+        git checkout "$2" || git checkout "origin/$2"
     )
 }
 

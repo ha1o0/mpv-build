@@ -1,19 +1,33 @@
-name: Build libmpv (Linux amd64)
+name: Build libmpv gpu-next (Linux x86_64)
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'libmpv version (e.g., v0.37.0)'
+      release_tag:
+        description: 'Release tag for the uploaded libmpv bundle'
         required: true
-        default: 'v0.37.0'
+        default: 'v0.37.0-gpu-next'
+      mpv_repository:
+        description: 'mpv repository to build'
+        required: true
+        default: 'https://github.com/ha1o0/mpv.git'
+      mpv_ref:
+        description: 'mpv branch, tag, or commit'
+        required: true
+        default: 'my-gpu-next'
+      archive_name:
+        description: 'Output archive base name'
+        required: true
+        default: 'libmpv-linux-x86_64-gpu-next'
 
 permissions:
   contents: write
 
 jobs:
   build:
+    name: Build Linux x86_64 bundle
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout mpv-build
         uses: actions/checkout@v4
@@ -22,85 +36,109 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            git \
-            yasm \
-            nasm \
-            pkg-config \
-            libtool \
             autoconf \
             automake \
-            libx11-dev \
-            libxv-dev \
-            libvdpau-dev \
-            libva-dev \
-            libgl1-mesa-dev \
-            libegl1-mesa-dev \
-            libgles2-mesa-dev \
-            libdrm-dev \
+            build-essential \
+            curl \
+            file \
+            git \
+            glslang-tools \
             libasound2-dev \
-            libpulse-dev \
-            libfribidi-dev \
-            libfreetype6-dev \
+            libdrm-dev \
+            libegl1-mesa-dev \
             libfontconfig1-dev \
+            libfreetype6-dev \
+            libfribidi-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
             libharfbuzz-dev \
             libjpeg-dev \
+            liblcms2-dev \
+            libpulse-dev \
             libssl-dev \
+            libtool \
+            libva-dev \
+            libvdpau-dev \
+            libvulkan-dev \
+            libx11-dev \
             libx264-dev \
+            libxv-dev \
+            nasm \
+            patchelf \
+            pkg-config \
+            python3-pip \
             python3-setuptools \
-            python3-pip
+            glslang-dev \
+            spirv-tools \
+            yasm \
+            zstd
 
-      - name: Install latest Meson and Ninja
+      - name: Install Meson and Ninja
         run: |
-          # 移除系统自带的旧版（如果有）并安装最新版
           sudo apt-get remove -y meson ninja-build || true
           python3 -m pip install --upgrade pip
           sudo pip3 install meson ninja
-          # 确保路径生效
-          echo "/usr/local/bin" >> $GITHUB_PATH
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
           meson --version
           ninja --version
 
+      - name: Select gpu-next mpv source
+        run: |
+          mkdir -p config
+          echo "@${{ github.event.inputs.mpv_ref }}" > config/branch-mpv
+          echo "Using mpv repository: ${{ github.event.inputs.mpv_repository }}"
+          echo "Using mpv ref: ${{ github.event.inputs.mpv_ref }}"
+
       - name: Configure FFmpeg options
         run: |
-          # 基本必须选项
           echo "--enable-gpl" >> ffmpeg_options
           echo "--enable-nonfree" >> ffmpeg_options
           echo "--enable-libx264" >> ffmpeg_options
-          
-          # 添加用户要求的 RM/RMVB 相关解码器
+          echo "--disable-vulkan" >> ffmpeg_options
           for decoder in rv10 rv20 rv30 rv40 cook atrac3 sipr ra_144 ra_288; do
             echo "--enable-decoder=$decoder" >> ffmpeg_options
           done
-          
-          echo "FFmpeg options configured:"
           cat ffmpeg_options
 
       - name: Configure mpv options
         run: |
           echo "-Dlibmpv=true" > mpv_options
-          echo "mpv options configured:"
           cat mpv_options
 
-      - name: Fetch sources and Build
+      - name: Fetch sources and build
+        env:
+          MPV_REPOSITORY: ${{ github.event.inputs.mpv_repository }}
         run: |
           ./update
-          ./rebuild -j$(nproc)
+          ./rebuild -j"$(nproc)"
 
-      - name: Prepare Artifact
+      - name: Package libmpv bundle
         run: |
-          mkdir -p output
-          # 复制生成的 .so 文件，并重命名以便分发
+          chmod +x scripts/package-libmpv-bundle
+          ./scripts/package-libmpv-bundle x86_64 "${{ github.event.inputs.archive_name }}" output
           cp mpv/build/libmpv.so output/libmpv-amd64.so
-          # 打印链接情况以供验证 (检查是否有意外的动态依赖)
-          ldd output/libmpv-amd64.so
+          ldd "output/${{ github.event.inputs.archive_name }}/lib/libmpv.so.2"
+          cat "output/${{ github.event.inputs.archive_name }}/manifest.txt"
+          cat "output/${{ github.event.inputs.archive_name }}.tar.zst.sha256"
 
-      - name: Create Release and Upload
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.archive_name }}
+          path: |
+            output/${{ github.event.inputs.archive_name }}.tar.zst
+            output/${{ github.event.inputs.archive_name }}.tar.zst.sha256
+            output/libmpv-amd64.so
+
+      - name: Create release and upload
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version }}
-          name: Release ${{ github.event.inputs.version }}
-          files: output/libmpv-amd64.so
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Release ${{ github.event.inputs.release_tag }}
+          files: |
+            output/${{ github.event.inputs.archive_name }}.tar.zst
+            output/${{ github.event.inputs.archive_name }}.tar.zst.sha256
+            output/libmpv-amd64.so
           draft: false
           prerelease: false
         env:

@@ -1,0 +1,30 @@
+From: Floe contributors <recipe@example.invalid>
+Subject: [PATCH] stream_curl: honor explicit application proxy routing
+
+An unset http-proxy still permits libcurl's environment policy. An explicitly
+empty string means direct, while a non-empty string selects the application's
+proxy. Do not let NO_PROXY override either explicit decision.
+
+---
+ stream/stream_curl.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/stream/stream_curl.c b/stream/stream_curl.c
+--- a/stream/stream_curl.c
++++ b/stream/stream_curl.c
+@@ -779,8 +779,14 @@
+ 
+     if (p->net_opts->useragent && p->net_opts->useragent[0])
+         curl_easy_setopt(c, CURLOPT_USERAGENT, p->net_opts->useragent);
+-    if (p->net_opts->http_proxy && p->net_opts->http_proxy[0])
++    // NULL keeps libcurl's environment policy. An explicit empty string must
++    // disable proxies, including those inherited from the process environment.
++    if (p->net_opts->http_proxy) {
+         curl_easy_setopt(c, CURLOPT_PROXY, p->net_opts->http_proxy);
++        // Routing was already decided by the application; NO_PROXY must not
++        // silently bypass an explicitly selected proxy.
++        curl_easy_setopt(c, CURLOPT_NOPROXY, "");
++    }
+ 
+     curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, p->net_opts->tls_verify ? 1L : 0L);

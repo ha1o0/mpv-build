@@ -1,6 +1,77 @@
 Overview
 ========
 
+Floe Linux zcopy build
+---------------------
+
+The ``my`` branch's ``Build libmpv gpu-next (Linux x86_64)`` workflow now
+defaults to ``ha1o0/mpv`` / ``zcopy``. The shared mpv branch supplies the custom
+gpu-next Render API, HDR/subtitle/Dolby Vision fixes, MKV skip-tags/defer-cues
+options and MP4 read strategy. Linux does not import Windows D3D11 or macOS
+CoreAudio build settings.
+
+``linux-build.json`` pins FFmpeg to the same revision as the Windows MP4
+companion patch (``f1126f23380c805b4b8fd69351d189aeac8b892b``, ``8.0.git``),
+libplacebo to ``v7.360.1``, and curl to the checksum-verified ``8.23.0`` release.
+curl is built as a shared library with HTTP/2 and OpenSSL support and included
+with its non-system dependencies in the bundle. This avoids Ubuntu 22.04's
+older curl while retaining the existing system OpenSSL dependency policy.
+HTTP/3 is not enabled by this recipe. OpenGL/EGL support is required; other
+Linux output and hardware features retain their automatic detection.
+
+The six patches listed in ``linux-build.json`` are copied from the reviewed
+Windows/macOS recipes: the Windows FFmpeg MOV patch and the five macOS curl
+patches, with patch 0003's Meson dependency adapted to ``static: false`` for
+Linux's shared curl. The network changes cover explicit proxy routing,
+timeouts/backpressure/retries, compatible FFmpeg defaults and HLS fallback,
+initial stream position and per-request FFmpeg reconnect options. The MP4
+patch remains opt-in from mpv and keeps fragmented/live inputs, MKV, HLS and
+ISO outside automatic MP4 scheduling. The MKV library defaults remain off;
+the application decides when to enable them.
+
+After mpv configuration, the specialized build checks Meson's actual curl
+link arguments before compiling libmpv. Its private dependencies must not be
+imported as system static archives (such as non-PIC ``libpsl.a``). FFmpeg,
+libass and libplacebo retain their existing static linkage. The check is
+enabled only by this entry point via ``MPV_BUILD_VERIFY_SHARED_CURL``.
+
+The specialized entry point is::
+
+    MPV_REPOSITORY=https://github.com/ha1o0/mpv.git MPV_REF=zcopy bash scripts/build-linux-zcopy
+
+It writes this build's option files, updates sources once, cleans before installing
+curl, applies patches with complete forward/reverse checks, and runs the
+existing build scripts. It does not use ``rebuild`` after patching, since that
+would fetch again. Generic ``build``, ``rebuild`` and source-selection defaults
+remain available as described below.
+Only this entry point enables ``MPV_BUILD_FETCH_FIXED_REFS`` so the shallow
+checkout explicitly fetches pinned commits and uses the requested branch's
+newly fetched revision rather than a stale local branch.
+
+Checks include the actual MP4 C scheduling/adapter regression, local HTTP and
+proxy servers for curl timeouts/retries/cancellation, native FFmpeg reconnect
+parsing, and 27 isolated libmpv cases: local/HTTP MP4 and MKV with paused seeks
+and resume, plus HLS EOF/errors/cancellation/recovery/AES-128 and MPEG-TS with
+curl enabled/disabled/default. The built library is checked for the required
+options, native defaults and Render API ABI. Two playback cases run again on
+the packaged library with the build's library path removed.
+
+The workflow retains the Ubuntu 22.04 build baseline and defaults to the new
+release tag ``v0.41.0-zcopy``. The archive base name stays
+``libmpv-linux-x86_64-gpu-next``. Use the complete ``.tar.zst`` bundle; the legacy
+standalone ``libmpv-amd64.so`` asset requires its matching dependencies too.
+The bundle contains source revisions, patch hashes, verified feature/default
+metadata tied to the original library's SHA-256, and curl's license. Validation
+logs are uploaded even when a later stage fails.
+
+After building and checking the new release, update Floe's Linux workflow
+``libmpv_release_tag`` and archive SHA-256. The application repository's current
+release references are not changed before a verified bundle exists.
+
+Offline source/packaging contract tests::
+
+    python3 -B -m unittest discover -s tests -p test_linux_build.py -v
+
 This is a collection of scripts to make downloading and building mpv, ffmpeg
 and libass easier. ffmpeg and libass get special treatment, because they are
 essential, and distribution packages are often too old or too broken.

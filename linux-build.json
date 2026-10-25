@@ -1,0 +1,21 @@
+{
+  "ffmpeg_ref": "f1126f23380c805b4b8fd69351d189aeac8b892b",
+  "libplacebo_ref": "v7.360.1",
+  "curl": {
+    "version": "8.23.0",
+    "url": "https://curl.se/download/curl-8.23.0.tar.gz",
+    "sha256": "e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49"
+  },
+  "patches": {
+    "ffmpeg": [
+      "packages/ffmpeg-0001-mov-bounded-interleave.patch"
+    ],
+    "mpv": [
+      "packages/mpv-0001-curl-honor-explicit-proxy-routing.patch",
+      "packages/mpv-0002-curl-preserve-network-policy.patch",
+      "packages/mpv-0003-curl-compatible-lavf-defaults.patch",
+      "packages/mpv-0004-curl-fix-initial-stream-position.patch",
+      "packages/mpv-0005-curl-inherit-lavf-reconnect-policy.patch"
+    ]
+  }
+}

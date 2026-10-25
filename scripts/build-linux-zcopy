@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- "$(dirname -- "$0")/.."
+BUILD_ROOT=$PWD
+JOBS=${JOBS:-$(nproc)}
+python3 -B -m unittest discover -s tests -p test_linux_build.py -v
+python3 scripts/linux_build.py configure --mpv-ref "${MPV_REF:-zcopy}"
+# Use one source-update phase. The generic rebuild command would fetch again after
+# patching and cleaning would remove the freshly built curl installation.
+MPV_BUILD_FETCH_FIXED_REFS=1 ./update --skip-selfupdate
+git -C libplacebo submodule update --init --recursive --depth 1
+./clean
+python3 scripts/build_linux_curl.py --jobs "$JOBS"
+export PKG_CONFIG_PATH="$BUILD_ROOT/build_libs/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export LD_LIBRARY_PATH="$BUILD_ROOT/build_libs/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# A local rebuild may already contain the FFmpeg patch. Feed the standalone
+# test a read-only snapshot of the pinned original blobs, not that worktree.
+mkdir -p build-linux-validation/ffmpeg-source/libavformat
+git -C ffmpeg show HEAD:libavformat/mov.c > build-linux-validation/ffmpeg-source/libavformat/mov.c
+git -C ffmpeg show HEAD:libavformat/isom.h > build-linux-validation/ffmpeg-source/libavformat/isom.h
+python3 mpv/test/lavf_mp4_read.py --ffmpeg-source build-linux-validation/ffmpeg-source --recipe "$BUILD_ROOT" --build-dir build-linux-validation
+python3 tests/test_curl_network_policy.py --mpv-source mpv --curl-prefix build_libs --work-dir build-linux-validation
+python3 scripts/linux_build.py patch
+MPV_BUILD_VERIFY_SHARED_CURL=1 ./build -j"$JOBS"
+python3 scripts/linux_build.py verify
+python3 tests/test_curl_reconnect.py --mpv-source mpv --ffmpeg-prefix build_libs --work-dir build-linux-validation
+
+mkdir -p build-linux-validation/media
+ffmpeg_build/ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=64x64:rate=25 -t 2 -an -c:v mpeg2video -g 25 -f hls -hls_time 1 -hls_segment_filename build-linux-validation/media/seg%d.ts build-linux-validation/media/index.m3u8
+ffmpeg_build/ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=64x64:rate=25 -f lavfi -i sine=frequency=1000:sample_rate=48000 -t 3 -c:v mpeg4 -q:v 5 -c:a aac -movflags +faststart build-linux-validation/media/video.mp4
+ffmpeg_build/ffmpeg -hide_banner -loglevel error -y -i build-linux-validation/media/video.mp4 -c copy build-linux-validation/media/video.mkv
+python3 tests/test_libmpv_playback.py --library mpv/build/libmpv.so --fixture build-linux-validation/media --output-dir build-linux-validation

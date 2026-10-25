@@ -80,7 +80,15 @@ do_fixedref()
 {
     (
         cd "$1"
-        git checkout "$2" || git checkout "origin/$2"
+        # The Linux zcopy recipe pins an older FFmpeg commit. Fetch it
+        # explicitly because the normal depth-1 branch fetch may omit it.
+        # Generic build/update callers retain their existing behavior.
+        if [ "${MPV_BUILD_FETCH_FIXED_REFS:-0}" = 1 ]; then
+            git fetch --depth 1 origin "$2"
+            git checkout --detach FETCH_HEAD
+        else
+            git checkout "$2" || git checkout "origin/$2"
+        fi
     )
 }
 

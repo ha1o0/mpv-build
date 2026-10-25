@@ -4,6 +4,7 @@ set -eu
 ARCH="${1:-x86_64}"
 BUNDLE_NAME="${2:-libmpv-linux-${ARCH}-gpu-next}"
 OUTPUT_DIR="${3:-output}"
+PACKAGE_PROFILE="${4:-generic}"
 ROOT_DIR="$OUTPUT_DIR/$BUNDLE_NAME"
 LIB_DIR="$ROOT_DIR/lib"
 
@@ -79,7 +80,15 @@ done
     done
 } > "$ROOT_DIR/manifest.txt"
 
+if [ "$PACKAGE_PROFILE" = zcopy ]; then
+    python3 scripts/linux_build.py provenance --package-root "$ROOT_DIR"
+fi
+
 ldd "$LIB_DIR/libmpv.so.2" > "$ROOT_DIR/ldd-libmpv.txt"
+if [ "$PACKAGE_PROFILE" = zcopy ] && LD_LIBRARY_PATH="$LIB_DIR" ldd "$LIB_DIR/libmpv.so.2" | grep -q 'not found'; then
+    echo "Packaged libmpv has missing shared-library dependencies" >&2
+    exit 1
+fi
 find "$LIB_DIR" -maxdepth 1 -type f -printf '%f\n' | sort > "$ROOT_DIR/lib-files.txt"
 
 mkdir -p "$OUTPUT_DIR"

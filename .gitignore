@@ -14,3 +14,6 @@
 /debian/mpv.substvars
 /config/
 /*_options
+/build-linux-curl
+/build-linux-validation
+/tests/__pycache__

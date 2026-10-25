@@ -17,4 +17,7 @@ if test -d libplacebo/3rdparty/Vulkan-Headers/include ; then
 fi
 
 scripts/mpv-config
+if [ "${MPV_BUILD_VERIFY_SHARED_CURL:-0}" = 1 ]; then
+    python3 scripts/linux_build.py verify-link
+fi
 scripts/mpv-build "$@"

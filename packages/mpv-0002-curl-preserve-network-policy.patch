@@ -1,0 +1,293 @@
+From: Floe contributors <recipe@example.invalid>
+Subject: [PATCH] stream_curl: preserve playback timeout and reconnect policy
+
+Honor network-timeout while waiting for headers/body, excluding ring-buffer
+backpressure. Bound streamed HTTP retries and schedule backoff without blocking
+other transfers. Validate HTTP responses on retries and seeks.
+
+---
+diff --git a/stream/stream_curl.c b/stream/stream_curl.c
+index 6f842055fee3aa3f55ee9505dd9565f8e7287d63..fc854604d7b1ca8ad87de64e8857757e7280b2a1 100644
+--- a/stream/stream_curl.c
++++ b/stream/stream_curl.c
+@@ -80,6 +80,8 @@ struct curl_opts {
+     int http_version;
+     int max_redirects;
+     int max_retries;
++    bool reconnect_streamed;
++    double retry_delay_max;
+     double connect_timeout;
+     int64_t buffer_size;
+     int64_t max_request_size;
+@@ -111,6 +113,8 @@ const struct m_sub_options curl_conf = {
+             )},
+         {"max-redirects", OPT_INT(max_redirects), M_RANGE(0, 100)},
+         {"max-retries", OPT_INT(max_retries), M_RANGE(0, 100)},
++        {"reconnect-streamed", OPT_BOOL(reconnect_streamed)},
++        {"retry-delay-max", OPT_DOUBLE(retry_delay_max), M_RANGE(0, 60)},
+         {"connect-timeout", OPT_DOUBLE(connect_timeout), M_RANGE(0, 600)},
+         {"buffer-size", OPT_BYTE_SIZE(buffer_size),
+             M_RANGE(2 * CURL_MAX_WRITE_SIZE, M_MAX_MEM_BYTES)},
+@@ -147,6 +151,7 @@ struct curl_ctx {
+     struct mp_dispatch_queue *dispatch;
+     CURLM *multi;
+     bool exit;
++    struct priv *retries;
+ };
+ 
+ // Per-stream state, owned by the curl thread.
+@@ -176,6 +181,11 @@ struct priv {
+     int retry_count;           // consecutive failed attempts at request_start
+     bool active;               // handle is currently active in the multi
+     bool finished;             // current request has reached EOF
++    double last_activity;
++    bool read_timed_out;
++    double retry_at;
++    struct priv *retry_next;
++    bool retry_queued;
+ 
+     // Probe state. Set on the curl thread read by curl_open after.
+     bool probed;
+@@ -215,6 +225,56 @@ struct cmd {
+ static void start_request(struct priv *p);
+ static void on_done(struct priv *p, CURLcode code);
+ 
++// Only the curl thread touches retries. Removing a stream or seeking must also
++// remove a delayed retry before the stream can be freed or reused.
++static void cancel_retry(struct priv *p)
++{
++    struct priv **entry = &p->ctx->retries;
++    while (*entry && *entry != p)
++        entry = &(*entry)->retry_next;
++    if (*entry)
++        *entry = p->retry_next;
++    p->retry_next = NULL;
++    p->retry_queued = false;
++}
++
++static void retry_request(struct priv *p)
++{
++    double delay = 0;
++    for (int i = 0; i < p->retry_count && delay < p->opts->retry_delay_max; i++)
++        delay = MPMIN(delay * 2 + 1, p->opts->retry_delay_max);
++    if (delay <= 0) {
++        start_request(p);
++        return;
++    }
++    p->retry_at = mp_time_sec() + delay;
++    p->retry_next = p->ctx->retries;
++    p->ctx->retries = p;
++    p->retry_queued = true;
++}
++
++static int process_retries(struct curl_ctx *ctx)
++{
++    int wait_ms = 1000;
++    double now = mp_time_sec();
++    struct priv **entry = &ctx->retries;
++    while (*entry) {
++        struct priv *p = *entry;
++        bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
++        if (aborted || p->retry_at <= now) {
++            *entry = p->retry_next;
++            p->retry_next = NULL;
++            p->retry_queued = false;
++            if (!aborted)
++                start_request(p);
++        } else {
++            wait_ms = MPMIN(wait_ms, (int)((p->retry_at - now) * 1000) + 1);
++            entry = &p->retry_next;
++        }
++    }
++    return wait_ms;
++}
++
+ static void run_cmd(void *arg)
+ {
+     struct cmd *c = arg;
+@@ -225,6 +285,7 @@ static void run_cmd(void *arg)
+         start_request(c->p);
+         break;
+     case CMD_REMOVE:
++        cancel_retry(c->p);
+         if (c->p->active) {
+             MP_TRACE(c->p, "removing curl handle\n");
+             curl_multi_remove_handle(ctx->multi, c->p->curl);
+@@ -237,10 +298,12 @@ static void run_cmd(void *arg)
+         mp_mutex_lock(&c->p->mtx);
+         MP_TRACE(c->p, "resuming curl transfer\n");
+         c->p->paused = false;
++        c->p->last_activity = mp_time_sec();
+         mp_mutex_unlock(&c->p->mtx);
+         curl_easy_pause(c->p->curl, CURLPAUSE_CONT);
+         break;
+     case CMD_SEEK:
++        cancel_retry(c->p);
+         MP_TRACE(c->p, "seeking to %" PRIu64 "\n", c->pos);
+         if (c->p->active) {
+             curl_multi_remove_handle(ctx->multi, c->p->curl);
+@@ -311,6 +374,8 @@ static MP_THREAD_VOID curl_thread(void *arg)
+         if (ctx->exit)
+             break;
+ 
++        int retry_wait_ms = process_retries(ctx);
++
+         int running = 0;
+         CURLMcode mres = curl_multi_perform(ctx->multi, &running);
+         if (mres != CURLM_OK && mres != CURLM_CALL_MULTI_PERFORM)
+@@ -329,7 +394,8 @@ static MP_THREAD_VOID curl_thread(void *arg)
+             on_done(p, msg->data.result);
+         }
+ 
+-        curl_multi_poll(ctx->multi, NULL, 0, 1000, NULL);
++        retry_wait_ms = MPMIN(retry_wait_ms, process_retries(ctx));
++        curl_multi_poll(ctx->multi, NULL, 0, retry_wait_ms, NULL);
+     }
+ 
+     curl_multi_cleanup(ctx->multi);
+@@ -401,6 +467,7 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
+ 
+     p->paused = false;
+     p->request_received += bytes;
++    p->last_activity = mp_time_sec();
+ 
+     mp_cond_broadcast(&p->cond);
+     mp_mutex_unlock(&p->mtx);
+@@ -412,7 +479,22 @@ static int xferinfo_callback(void *userdata, curl_off_t dl_total, curl_off_t dl_
+                              curl_off_t ul_total, curl_off_t ul_now)
+ {
+     struct priv *p = userdata;
+-    return atomic_load_explicit(&p->aborted, memory_order_relaxed);
++    if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
++        return 1;
++    double now = mp_time_sec();
++    mp_mutex_lock(&p->mtx);
++    bool paused = p->paused;
++    mp_mutex_unlock(&p->mtx);
++    if (paused) {
++        // Backpressure is not a network stall. CMD_UNPAUSE also resets this
++        // clock in case libcurl does not call progress while paused.
++        p->last_activity = now;
++    } else if (p->net_opts->timeout > 0 &&
++               now - p->last_activity >= p->net_opts->timeout) {
++        p->read_timed_out = true;
++        return 1;
++    }
++    return 0;
+ }
+ 
+ static int64_t parse_content_range_total(const char *value)
+@@ -462,6 +544,7 @@ static void probe_http(struct priv *p, struct bstr line)
+         // 1xx/3xx responses don't leak ICY metadata into the final one.
+         mp_mutex_lock(&p->mtx);
+         if (bstr_startswith0(line, "HTTP/")) {
++            p->stream_ok = false;
+             mp_icy_reset(p->icy);
+         } else {
+             mp_icy_add_header(p->icy, line);
+@@ -480,6 +563,13 @@ static void probe_http(struct priv *p, struct bstr line)
+         goto done;
+     }
+ 
++    // Validate every retry/seek response, but retain the original stream's
++    // size/seekability. The reader may be using those fields concurrently.
++    if (p->probed) {
++        p->stream_ok = true;
++        return;
++    }
++
+     // Compressed responses are byte-addressed in the encoded representation,
+     // which our caller can't translate, so they are non-seekable.
+     const char *ce = header_value(p->curl, "Content-Encoding");
+@@ -507,7 +597,8 @@ static void probe_http(struct priv *p, struct bstr line)
+     }
+     p->stream_ok = true;
+ done:
+-    finalize_probe(p);
++    if (!p->probed)
++        finalize_probe(p);
+ }
+ 
+ static void probe_ftp(struct priv *p, struct bstr line)
+@@ -536,8 +627,9 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
+ {
+     struct priv *p = userdata;
+     size_t bytes = size * nitems;
++    p->last_activity = mp_time_sec();
+ 
+-    if (p->probed)
++    if (p->probed && p->scheme->proto != MP_CURL_PROTO_HTTP)
+         return bytes;
+ 
+     struct bstr line = bstr_strip_linebreaks((bstr){buffer, bytes});
+@@ -637,6 +729,8 @@ static void start_request(struct priv *p)
+     }
+ 
+     p->request_received = 0;
++    p->read_timed_out = false;
++    p->last_activity = mp_time_sec();
+     p->active = true;
+     curl_multi_add_handle(p->ctx->multi, p->curl);
+ }
+@@ -658,13 +752,27 @@ static void log_curl_error(struct priv *p, const char *what, CURLcode code)
+ static void on_done(struct priv *p, CURLcode code)
+ {
+     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
++    if (!aborted && p->read_timed_out && code == CURLE_ABORTED_BY_CALLBACK)
++        code = CURLE_OPERATION_TIMEDOUT;
++
++    bool streamed_retry = p->opts->reconnect_streamed &&
++                          p->scheme->proto == MP_CURL_PROTO_HTTP;
++    bool recoverable = !aborted && (p->seekable || streamed_retry) &&
++                       is_recoverable_error(code) &&
++                       p->retry_count < p->opts->max_retries;
+ 
+     if (!p->probed) {
++        if (recoverable) {
++            p->retry_count++;
++            retry_request(p);
++            return;
++        }
+         // Connection died before any headers arrived.
+         if (code != CURLE_OK && !aborted)
+             log_curl_error(p, "error", code);
+         mp_mutex_lock(&p->mtx);
+         p->probed = true;
++        p->stream_error = code != CURLE_OK;
+         mp_cond_broadcast(&p->cond);
+         mp_mutex_unlock(&p->mtx);
+         return;
+@@ -696,14 +804,15 @@ static void on_done(struct priv *p, CURLcode code)
+ 
+     // Try to recover if the stream is seekable and the failure looks
+     // recoverable.
+-    bool recoverable = !aborted && p->seekable &&
+-                       is_recoverable_error(code) &&
+-                       p->retry_count < p->opts->max_retries;
+     if (recoverable) {
+         p->retry_count++;
++        // Match FFmpeg's reconnect_streamed behavior: an unseekable live
++        // stream restarts at its live head, never with an invented Range.
++        if (!p->seekable)
++            p->request_start = 0;
+         MP_WARN(p, "%s, retrying (#%d) from %" PRIu64 "\n",
+                 curl_easy_strerror(code), p->retry_count, p->request_start);
+-        start_request(p);
++        retry_request(p);
+         return;
+     }
+ 
+@@ -774,8 +883,11 @@ static void setup_curl(struct priv *p)
+     curl_easy_setopt(c, CURLOPT_HTTP_VERSION, (long)p->opts->http_version);
+     curl_easy_setopt(c, CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
+     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+-    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS,
+-                     (long)(p->opts->connect_timeout * 1000));
++    double connect_timeout = p->opts->connect_timeout;
++    if (p->net_opts->timeout > 0)
++        connect_timeout = connect_timeout > 0
++            ? MPMIN(connect_timeout, p->net_opts->timeout) : p->net_opts->timeout;
++    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, (long)(connect_timeout * 1000));
+ 
+     if (p->net_opts->useragent && p->net_opts->useragent[0])
+         curl_easy_setopt(c, CURLOPT_USERAGENT, p->net_opts->useragent);

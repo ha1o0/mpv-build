@@ -1,0 +1,33 @@
+From: Floe contributors <recipe@example.invalid>
+Subject: [PATCH] stream_curl: initialize stream position before starting transfer
+
+A short response can finish on the curl thread before curl_open returns.
+on_done advances request_start to the next network offset, while all received
+bytes are still buffered for the consumer. Reading request_start at that point
+sets the stream's initial position past its beginning and breaks demux probing
+on non-seekable HTTP responses. Snapshot the initial position before CMD_ADD
+allows the curl thread to advance it. Preserve explicit HLS byte-range offsets.
+
+---
+diff --git a/stream/stream_curl.c b/stream/stream_curl.c
+--- a/stream/stream_curl.c
++++ b/stream/stream_curl.c
+@@ -1095,6 +1095,10 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
+     setup_curl(p);
+     mp_cancel_set_cb(s->cancel, on_cancel, p);
+ 
++    // The curl thread can finish a short response before this function returns
++    // and advance request_start, even though the consumer has read no bytes.
++    s->pos = p->request_start;
++
+     cmd_sync(p, CMD_ADD, 0, false);
+ 
+     mp_mutex_lock(&p->mtx);
+@@ -1129,7 +1133,6 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
+     s->get_size = curl_get_size;
+     s->control = curl_control;
+     s->close = curl_close;
+-    s->pos = p->request_start;
+ 
+     return STREAM_OK;
+ }

@@ -6,7 +6,7 @@ on:
       release_tag:
         description: 'Release tag for the uploaded libmpv bundle'
         required: true
-        default: 'v0.37.0-gpu-next'
+        default: 'v0.41.0-zcopy'
       mpv_repository:
         description: 'mpv repository to build'
         required: true
@@ -14,7 +14,7 @@ on:
       mpv_ref:
         description: 'mpv branch, tag, or commit'
         required: true
-        default: 'my-gpu-next'
+        default: 'zcopy'
       archive_name:
         description: 'Output archive base name'
         required: true
@@ -39,6 +39,7 @@ jobs:
             autoconf \
             automake \
             build-essential \
+            cmake \
             curl \
             file \
             git \
@@ -54,7 +55,12 @@ jobs:
             libharfbuzz-dev \
             libjpeg-dev \
             liblcms2-dev \
+            libnghttp2-dev \
             libpulse-dev \
+            libpsl-dev \
+            libbrotli-dev \
+            libzstd-dev \
+            libssh2-1-dev \
             libssl-dev \
             libtool \
             libva-dev \
@@ -68,6 +74,7 @@ jobs:
             pkg-config \
             python3-pip \
             python3-setuptools \
+            zlib1g-dev \
             glslang-dev \
             spirv-tools \
             yasm \
@@ -82,44 +89,25 @@ jobs:
           meson --version
           ninja --version
 
-      - name: Select gpu-next mpv source
-        run: |
-          mkdir -p config
-          echo "@${{ github.event.inputs.mpv_ref }}" > config/branch-mpv
-          echo "Using mpv repository: ${{ github.event.inputs.mpv_repository }}"
-          echo "Using mpv ref: ${{ github.event.inputs.mpv_ref }}"
-
-      - name: Configure FFmpeg options
-        run: |
-          echo "--enable-gpl" >> ffmpeg_options
-          echo "--enable-nonfree" >> ffmpeg_options
-          echo "--enable-libx264" >> ffmpeg_options
-          echo "--disable-vulkan" >> ffmpeg_options
-          for decoder in rv10 rv20 rv30 rv40 cook atrac3 sipr ra_144 ra_288; do
-            echo "--enable-decoder=$decoder" >> ffmpeg_options
-          done
-          cat ffmpeg_options
-
-      - name: Configure mpv options
-        run: |
-          echo "-Dlibmpv=true" > mpv_options
-          cat mpv_options
-
-      - name: Fetch sources and build
+      - name: Fetch, patch, build and verify zcopy
         env:
           MPV_REPOSITORY: ${{ github.event.inputs.mpv_repository }}
+          MPV_REF: ${{ github.event.inputs.mpv_ref }}
         run: |
-          ./update
-          ./rebuild -j"$(nproc)"
+          bash scripts/build-linux-zcopy
 
       - name: Package libmpv bundle
+        env:
+          ARCHIVE_NAME: ${{ github.event.inputs.archive_name }}
         run: |
+          export LD_LIBRARY_PATH="$PWD/build_libs/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           chmod +x scripts/package-libmpv-bundle
-          ./scripts/package-libmpv-bundle x86_64 "${{ github.event.inputs.archive_name }}" output
-          cp mpv/build/libmpv.so output/libmpv-amd64.so
-          ldd "output/${{ github.event.inputs.archive_name }}/lib/libmpv.so.2"
-          cat "output/${{ github.event.inputs.archive_name }}/manifest.txt"
-          cat "output/${{ github.event.inputs.archive_name }}.tar.zst.sha256"
+          ./scripts/package-libmpv-bundle x86_64 "$ARCHIVE_NAME" output zcopy
+          cp "output/$ARCHIVE_NAME/lib/libmpv.so.2" output/libmpv-amd64.so
+          ldd "output/$ARCHIVE_NAME/lib/libmpv.so.2"
+          cat "output/$ARCHIVE_NAME/manifest.txt"
+          cat "output/$ARCHIVE_NAME.tar.zst.sha256"
+          env -u LD_LIBRARY_PATH python3 tests/test_libmpv_playback.py --library "output/$ARCHIVE_NAME/lib/libmpv.so.2" --fixture build-linux-validation/media --case http-mp4 --case hls-encrypted --curl auto --output-dir build-linux-validation
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -129,6 +117,18 @@ jobs:
             output/${{ github.event.inputs.archive_name }}.tar.zst
             output/${{ github.event.inputs.archive_name }}.tar.zst.sha256
             output/libmpv-amd64.so
+
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-zcopy-validation
+          if-no-files-found: ignore
+          path: |
+            build-linux-validation/
+            mpv/build/meson-logs/
+            mpv/build/meson-info/intro-dependencies.json
+            build-linux-curl/build/CMakeCache.txt
 
       - name: Create release and upload
         uses: softprops/action-gh-release@v2

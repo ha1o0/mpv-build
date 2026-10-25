@@ -1,0 +1,241 @@
+From: Floe contributors <recipe@example.invalid>
+Subject: [PATCH] stream_curl: inherit per-request FFmpeg reconnect policy
+
+Preserve the caller's reconnect, reconnect_streamed,
+reconnect_on_network_error and reconnect_delay_max on nested HTTP AVIO.
+A request dictionary takes precedence over curl retry options, with
+curl-max-retries remaining a bound. Requests without these keys retain
+the original policy; disabled/unsupported curl leaves the dictionary alone.
+Use FFmpeg's 0, 1, 3, ... give-up delay threshold and the existing cancellable
+retry queue. Keep normal EOF and HTTP status errors non-retryable.
+
+---
+diff --git a/stream/stream_curl.c b/stream/stream_curl.c
+index 4371716..1d297fb 100644
+--- a/stream/stream_curl.c
++++ b/stream/stream_curl.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include <inttypes.h>
++#include <limits.h>
+ #include <stdatomic.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -67,12 +68,61 @@ static const struct curl_scheme curl_schemes[] = {
+     {bstr0_lit("ftps"), MP_CURL_PROTO_FTP},
+ };
+ 
++// Per-request compatibility policy for the four FFmpeg reconnect options used
++// by callers. A dictionary takes precedence over curl's global retry policy;
++// requests without these options keep the original curl behavior.
++struct curl_reconnect_opts {
++    const AVClass *av_class;
++    bool set;
++    int reconnect;
++    int reconnect_streamed;
++    int reconnect_on_network_error;
++    int reconnect_delay_max;
++};
++
++static const AVOption curl_reconnect_options[] = {
++    {"reconnect", NULL, offsetof(struct curl_reconnect_opts, reconnect),
++     AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM},
++    {"reconnect_streamed", NULL, offsetof(struct curl_reconnect_opts, reconnect_streamed),
++     AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM},
++    {"reconnect_on_network_error", NULL,
++     offsetof(struct curl_reconnect_opts, reconnect_on_network_error),
++     AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM},
++    {"reconnect_delay_max", NULL, offsetof(struct curl_reconnect_opts, reconnect_delay_max),
++     AV_OPT_TYPE_INT, {.i64 = 120}, 0, UINT_MAX / 1000 / 1000, AV_OPT_FLAG_DECODING_PARAM},
++    {0}
++};
++
++static const AVClass curl_reconnect_class = {
++    .class_name = "mpv_curl_reconnect",
++    .item_name = av_default_item_name,
++    .option = curl_reconnect_options,
++    .version = LIBAVUTIL_VERSION_INT,
++};
++
++static int read_lavf_reconnect(AVDictionary *options, struct curl_reconnect_opts *opts)
++{
++    *opts = (struct curl_reconnect_opts){.av_class = &curl_reconnect_class};
++    av_opt_set_defaults(opts);
++    for (const AVOption *opt = curl_reconnect_options; opt->name; opt++) {
++        AVDictionaryEntry *entry = av_dict_get(options, opt->name, NULL, 0);
++        if (entry) {
++            int ret = av_opt_set(opts, opt->name, entry->value, 0);
++            if (ret < 0)
++                return ret;
++            opts->set = true;
++        }
++    }
++    return 0;
++}
++
+ // Special args for use by lavf. Matches lavf/http.c "offset"/"end_offset" opts.
+ // `offset` is the inclusive starting byte.
+ // `end_offset` is the exclusive upper bound (0 = unbounded).
+ struct curl_open_args {
+     int64_t offset;
+     int64_t end_offset;
++    struct curl_reconnect_opts reconnect;
+ };
+ 
+ struct curl_opts {
+@@ -196,6 +246,12 @@ struct priv {
+     double retry_at;
+     struct priv *retry_next;
+     bool retry_queued;
++    bool request_has_response; // reset for every retry, unlike stream-wide probed
++    bool lavf_reconnect_set;
++    int lavf_reconnect;
++    int lavf_reconnect_streamed;
++    int lavf_reconnect_on_network_error;
++    int lavf_reconnect_delay_max;
+ 
+     // Probe state. Set on the curl thread read by curl_open after.
+     bool probed;
+@@ -248,19 +304,29 @@ static void cancel_retry(struct priv *p)
+     p->retry_queued = false;
+ }
+ 
+-static void retry_request(struct priv *p)
++static bool retry_request(struct priv *p)
+ {
+     double delay = 0;
+-    for (int i = 0; i < p->retry_count && delay < p->opts->retry_delay_max; i++)
+-        delay = MPMIN(delay * 2 + 1, p->opts->retry_delay_max);
++    if (p->lavf_reconnect_set) {
++        // FFmpeg's maximum is a give-up threshold, not a capped delay:
++        // retry 0, 1, 3, ... seconds, stopping before a delay above the limit.
++        for (int i = 1; i < p->retry_count && delay <= p->lavf_reconnect_delay_max; i++)
++            delay = delay * 2 + 1;
++        if (delay > p->lavf_reconnect_delay_max)
++            return false;
++    } else {
++        for (int i = 0; i < p->retry_count && delay < p->opts->retry_delay_max; i++)
++            delay = MPMIN(delay * 2 + 1, p->opts->retry_delay_max);
++    }
+     if (delay <= 0) {
+         start_request(p);
+-        return;
++        return true;
+     }
+     p->retry_at = mp_time_sec() + delay;
+     p->retry_next = p->ctx->retries;
+     p->ctx->retries = p;
+     p->retry_queued = true;
++    return true;
+ }
+ 
+ static int process_retries(struct curl_ctx *ctx)
+@@ -568,6 +634,7 @@ static void probe_http(struct priv *p, struct bstr line)
+     if (resp < 200 || (resp >= 300 && resp < 400))
+         return;
+ 
++    p->request_has_response = true;
+     if (!is_http_success(resp)) {
+         MP_ERR(p, "HTTP error %ld\n", resp);
+         goto done;
+@@ -739,6 +806,7 @@ static void start_request(struct priv *p)
+     }
+ 
+     p->request_received = 0;
++    p->request_has_response = false;
+     p->read_timed_out = false;
+     p->last_activity = mp_time_sec();
+     p->active = true;
+@@ -765,17 +833,37 @@ static void on_done(struct priv *p, CURLcode code)
+     if (!aborted && p->read_timed_out && code == CURLE_ABORTED_BY_CALLBACK)
+         code = CURLE_OPERATION_TIMEDOUT;
+ 
++    // FFmpeg starts a new retry budget after a read returns data. Keep the
++    // limit on consecutive failures, so a recovering live stream can continue.
++    if (p->lavf_reconnect_set && p->request_received > 0)
++        p->retry_count = 0;
++
+     bool streamed_retry = p->opts->reconnect_streamed &&
+                           p->scheme->proto == MP_CURL_PROTO_HTTP;
+-    bool recoverable = !aborted && (p->seekable || streamed_retry) &&
+-                       is_recoverable_error(code) &&
++    bool retry_allowed = p->seekable || streamed_retry;
++    bool recoverable_error = is_recoverable_error(code);
++    if (p->lavf_reconnect_set) {
++        // A later retry can fail before receiving headers, even though this
++        // stream was probed successfully earlier. Do not treat that as a read
++        // disconnect or let reconnect_streamed alone authorize any retry.
++        bool connect_error = !p->request_has_response ||
++                             code == CURLE_COULDNT_CONNECT ||
++                             code == CURLE_COULDNT_RESOLVE_HOST ||
++                             code == CURLE_COULDNT_RESOLVE_PROXY ||
++                             code == CURLE_SSL_CONNECT_ERROR;
++        retry_allowed = connect_error ? p->lavf_reconnect_on_network_error :
++                        p->lavf_reconnect && (p->seekable || p->lavf_reconnect_streamed);
++        recoverable_error |= code == CURLE_COULDNT_RESOLVE_PROXY ||
++                             code == CURLE_SSL_CONNECT_ERROR;
++    }
++    bool recoverable = !aborted && retry_allowed && recoverable_error &&
+                        p->retry_count < p->opts->max_retries;
+ 
+     if (!p->probed) {
+         if (recoverable) {
+             p->retry_count++;
+-            retry_request(p);
+-            return;
++            if (retry_request(p))
++                return;
+         }
+         // Connection died before any headers arrived.
+         if (code != CURLE_OK && !aborted)
+@@ -822,8 +910,8 @@ static void on_done(struct priv *p, CURLcode code)
+             p->request_start = 0;
+         MP_WARN(p, "%s, retrying (#%d) from %" PRIu64 "\n",
+                 curl_easy_strerror(code), p->retry_count, p->request_start);
+-        retry_request(p);
+-        return;
++        if (retry_request(p))
++            return;
+     }
+ 
+     if (!aborted)
+@@ -1085,6 +1173,13 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
+             p->request_start = oa->offset;
+         if (oa->end_offset > 0)
+             p->request_end = oa->end_offset;
++        if (oa->reconnect.set) {
++            p->lavf_reconnect_set = true;
++            p->lavf_reconnect = oa->reconnect.reconnect;
++            p->lavf_reconnect_streamed = oa->reconnect.reconnect_streamed;
++            p->lavf_reconnect_on_network_error = oa->reconnect.reconnect_on_network_error;
++            p->lavf_reconnect_delay_max = oa->reconnect.reconnect_delay_max;
++        }
+     }
+ 
+     mp_mutex_init(&p->mtx);
+@@ -1272,6 +1367,11 @@ static int open_curl_transport(struct demuxer *demuxer, AVIOContext **pb_out,
+     mp_require(demuxer->global && demuxer->global->curl);
+ 
+     struct curl_open_args oa = {0};
++    if (cs->proto == MP_CURL_PROTO_HTTP) {
++        int r = read_lavf_reconnect(options ? *options : NULL, &oa.reconnect);
++        if (r < 0)
++            return r;
++    }
+     if (options && *options) {
+         AVDictionaryEntry *e;
+         // lavf's http demuxer exposes initial/final byte offsets as AVOptions
+@@ -1338,6 +1438,12 @@ static int open_curl_transport(struct demuxer *demuxer, AVIOContext **pb_out,
+ 
+     *pb_out = pb;
+     *cookie_out = c;
++    // Only consume after taking ownership successfully. Disabled curl and
++    // unsupported URLs return before parsing, leaving Lavf's options intact.
++    if (oa.reconnect.set) {
++        for (const AVOption *opt = curl_reconnect_options; opt->name; opt++)
++            av_dict_set(options, opt->name, NULL, 0);
++    }
+     return 0;
+ }
+ 

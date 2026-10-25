@@ -1,0 +1,92 @@
+From: Floe contributors <recipe@example.invalid>
+Subject: [PATCH] preserve lavf policy defaults and use shared curl on Linux
+
+Retain the compatible lavf version guards, runtime HLS fallback and TLS
+defaults from the macOS compatibility patch. The Linux FFmpeg pin already
+contains the required failed-open and normal-close IO cleanup fixes.
+Select shared libcurl explicitly for the Linux bundle. Its private
+dependencies must not be pulled into libmpv as non-PIC system archives.
+
+---
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index e1425df..4253c28 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -1419,7 +1419,7 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
+     // URLContext, so ffio_geturlcontext() returns NULL and av_assert0() trips.
+     // Note that our implementation will reuse and multiplex connections.
+     // This will be fixed upstream, but keep compatibility with older versions.
+-    if (demuxer->access_references) {
++    if (demuxer->access_references && mp_curl_is_enabled(demuxer->global)) {
+         av_dict_set(&dopts, "http_persistent", "0", 0);
+         // Actually enable http_multiple, this is basic prefetching logic in
+         // HLS demuxer. We just need to avoid autodetection (-1) which would
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -626,7 +626,7 @@ if darwin
+     subdir(join_paths('TOOLS', 'osxbundle'))
+ endif
+ 
+-libcurl = dependency('libcurl', version: '>= 7.88.0', required: get_option('libcurl'))
++libcurl = dependency('libcurl', version: '>= 7.88.0', static: false, required: get_option('libcurl'))
+ features += {'libcurl': libcurl.found()}
+ if features['libcurl']
+     dependencies += [libcurl]
+diff --git a/stream/network.c b/stream/network.c
+index 9be36d3..8df7e54 100644
+--- a/stream/network.c
++++ b/stream/network.c
+@@ -51,7 +51,9 @@ const struct m_sub_options mp_network_conf = {
+     .defaults = &(const struct mp_network_opts){
+         .useragent = "libmpv",
+         .timeout = 60,
+-#if HAVE_LIBCURL || LIBAVFORMAT_VERSION_MAJOR >= 63
++// Preserve the existing FFmpeg 7.1 application's default TLS policy when curl
++// is compiled in. Explicit tls-verify options still apply to both backends.
++#if LIBAVFORMAT_VERSION_MAJOR >= 63
+         .tls_verify = true,
+ #endif
+     },
+diff --git a/stream/stream_curl.c b/stream/stream_curl.c
+index fc85460..f34d628 100644
+--- a/stream/stream_curl.c
++++ b/stream/stream_curl.c
+@@ -95,6 +95,8 @@ struct curl_opts {
+ #define CURL_BY_DEFAULT /* 8.1 backport */
+ #elif LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 3, 103) && LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(62, 4, 0)
+ #define CURL_BY_DEFAULT /* 8.0 backport */
++#elif LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 7, 103) && LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(61, 8, 0)
++#define CURL_BY_DEFAULT /* 7.1 backports: ed860ef7d9b6 + 1a7e802c8f97 */
+ #endif
+ 
+ #define OPT_BASE_STRUCT struct curl_opts
+@@ -136,6 +138,14 @@ const struct m_sub_options curl_conf = {
+     .size = sizeof(struct curl_opts),
+ };
+ 
++bool mp_curl_is_enabled(struct mpv_global *global)
++{
++    struct curl_opts *opts = mp_get_config_group(NULL, global, &curl_conf);
++    bool enabled = opts->enabled;
++    talloc_free(opts);
++    return enabled;
++}
++
+ static const struct curl_scheme *curl_scheme_lookup(bstr url)
+ {
+     bstr scheme = mp_split_proto(url, NULL);
+diff --git a/stream/stream_curl.h b/stream/stream_curl.h
+index 6e5016d..414b12f 100644
+--- a/stream/stream_curl.h
++++ b/stream/stream_curl.h
+@@ -29,6 +29,9 @@ struct demuxer;
+ // Initialize libcurl state, must be called before stream_curl is used.
+ void mp_curl_global_init(struct mpv_global *global);
+ 
++// Current runtime setting, including per-file curl-enabled overrides.
++bool mp_curl_is_enabled(struct mpv_global *global);
++
+ // Open `url` via mpv's libcurl backend and wrap it as a fresh AVIOContext.
+ // On success returns 0, fills *pb_out with the new context, and sets *data to
+ // an opaque handle that must later be passed to mp_curl_avio_close() to
